@@ -1,4 +1,5 @@
 require("@nomiclabs/hardhat-waffle");
+require("dotenv").config();
 
 // You need to export an object to set up your config
 // Go to https://hardhat.org/config/ to learn more
@@ -19,6 +20,10 @@ module.exports = {
       accounts: {
         mnemonic: "swap swap swap swap swap swap swap swap swap swap swap swap"
       },
+      forking: {
+        url: process.env.ALCHE_API,
+        blockNumber: 12489619
+      }
     },
   },
   solidity: {

@@ -1,6 +1,5 @@
 //SPDX-License-Identifier: Unlicense
 pragma solidity ^0.8.7;
-
 import "hardhat/console.sol";
 
 // ----------------------INTERFACE------------------------------
@@ -128,6 +127,10 @@ interface IUniswapV2Pair {
             uint112 reserve1,
             uint32 blockTimestampLast
         );
+        
+    // Add these two functions to the interface
+    function token0() external view returns (address);
+    function token1() external view returns (address);
 }
 
 // ----------------------IMPLEMENTATION------------------------------
@@ -136,7 +139,24 @@ contract LiquidationOperator is IUniswapV2Callee {
     uint8 public constant health_factor_decimals = 18;
 
     // TODO: define constants used in the contract including ERC-20 tokens, Uniswap Pairs, Aave lending pools, etc. */
-    //    *** Your code here ***
+    // Tokens
+    address public constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address public constant WBTC = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
+    address public constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+
+    // Uniswap
+    address public constant UNISWAP_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address public constant WBTC_USDT_PAIR = 0x0DE0Fa91b6DbaB8c8503aAA2D1DFa91a192cB149; // WBTC/USDT pair
+
+    // Aave
+    address public constant AAVE_LENDING_POOL = 0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9;
+
+    // Target user to liquidate (from the README)
+    address public constant TARGET_USER = 0x59CE4a2AC5bC3f5F225439B2993b86B42f6d3e9F;
+
+    // Token0 and Token1 in the WBTC/USDT pair
+    address public constant TOKEN0 = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599; // WBTC
+    address public constant TOKEN1 = 0xdAC17F958D2ee523a2206206994597C13D831ec7; // USDT
     // END TODO
 
     // some helper function, it is totally fine if you can finish the lab without using these function
@@ -184,7 +204,7 @@ contract LiquidationOperator is IUniswapV2Callee {
     }
 
     // TODO: add a `receive` function so that you can withdraw your WETH
-    //   *** Your code here ***
+    receive() external payable {}
     // END TODO
 
     // required by the testing script, entry for your liquidation call
@@ -192,44 +212,126 @@ contract LiquidationOperator is IUniswapV2Callee {
         // TODO: implement your liquidation logic
 
         // 0. security checks and initializing variables
-        //    *** Your code here ***
+        ILendingPool lendingPool = ILendingPool(AAVE_LENDING_POOL);
+        IUniswapV2Pair pair = IUniswapV2Pair(WBTC_USDT_PAIR);
 
         // 1. get the target user account data & make sure it is liquidatable
-        //    *** Your code here ***
-
+        (
+            ,
+            ,
+            ,
+            ,
+            ,
+            uint256 healthFactor
+        ) = lendingPool.getUserAccountData(TARGET_USER);
+        
+        // Health factor is scaled by 1e18, if it's below 1e18 the position is liquidatable
+        require(healthFactor < 10**health_factor_decimals, "Target user position is healthy");
+        
         // 2. call flash swap to liquidate the target user
-        // based on https://etherscan.io/tx/0xac7df37a43fab1b130318bbb761861b8357650db2e2c6493b73d6da3d9581077
-        // we know that the target user borrowed USDT with WBTC as collateral
-        // we should borrow USDT, liquidate the target user and get the WBTC, then swap WBTC to repay uniswap
-        // (please feel free to develop other workflows as long as they liquidate the target user successfully)
-        //    *** Your code here ***
+        // Based on the transaction in the README, we need to borrow USDT via flash swap
+        // The amount to borrow is based on the debt we want to cover
+        uint256 debtToCover = 2000000 * 10**6; // 2,000,000 USDT (USDT has 6 decimals)
+        
+        // Prepare data for the callback
+        bytes memory data = abi.encode(TARGET_USER);
+        
+        // Initiate flash swap - borrow USDT (token1 in the pair)
+        // amount0Out is 0 because we're not taking out any WBTC
+        // amount1Out is the amount of USDT we want to borrow
+        pair.swap(0, debtToCover, address(this), data);
 
         // 3. Convert the profit into ETH and send back to sender
-        //    *** Your code here ***
-
+        // After the flash swap callback completes, we should have WBTC profit
+        uint256 wbtcBalance = IERC20(WBTC).balanceOf(address(this));
+        if (wbtcBalance > 0) {
+            // Find WBTC/WETH pair
+            address wbtcWethPair = IUniswapV2Factory(UNISWAP_FACTORY).getPair(WBTC, WETH);
+            
+            // Approve WBTC transfer to the pair
+            IERC20(WBTC).approve(wbtcWethPair, wbtcBalance);
+            
+            // Get reserves to calculate swap amount
+            (uint112 reserve0, uint112 reserve1, ) = IUniswapV2Pair(wbtcWethPair).getReserves();
+            
+            // Make sure reserve0 is WBTC and reserve1 is WETH (or vice versa)
+            uint256 wethOut;
+            if (IUniswapV2Pair(wbtcWethPair).token0() == WBTC) {
+                wethOut = getAmountOut(wbtcBalance, reserve0, reserve1);
+                IUniswapV2Pair(wbtcWethPair).swap(0, wethOut, address(this), new bytes(0));
+            } else {
+                wethOut = getAmountOut(wbtcBalance, reserve1, reserve0);
+                IUniswapV2Pair(wbtcWethPair).swap(wethOut, 0, address(this), new bytes(0));
+            }
+            
+            // Unwrap WETH to ETH
+            IWETH(WETH).withdraw(IERC20(WETH).balanceOf(address(this)));
+            
+            // Send ETH to the caller
+            payable(msg.sender).transfer(address(this).balance);
+        }
         // END TODO
     }
 
     // required by the swap
     function uniswapV2Call(
-        address,
-        uint256,
+        address sender,
+        uint256 amount0,
         uint256 amount1,
-        bytes calldata
+        bytes calldata data
     ) external override {
         // TODO: implement your liquidation logic
 
         // 2.0. security checks and initializing variables
-        //    *** Your code here ***
-
+        require(msg.sender == WBTC_USDT_PAIR, "Unauthorized callback");
+        require(sender == address(this), "Unauthorized sender");
+        
+        // Decode the data passed from the operate function
+        address targetUser = abi.decode(data, (address));
+        
+        // Get references to contracts
+        ILendingPool lendingPool = ILendingPool(AAVE_LENDING_POOL);
+        
         // 2.1 liquidate the target user
-        //    *** Your code here ***
-
-        // 2.2 swap WBTC for other things or repay directly
-        //    *** Your code here ***
-
+        // Approve USDT for the lending pool
+        IERC20(USDT).approve(AAVE_LENDING_POOL, amount1);
+        
+        // Execute liquidation - we want to receive WBTC as collateral
+        lendingPool.liquidationCall(
+            WBTC,       // collateral asset (WBTC)
+            USDT,       // debt asset (USDT)
+            targetUser, // user to liquidate
+            amount1,    // amount of debt to cover
+            false       // receive the underlying collateral, not aTokens
+        );
+        
+        // 2.2 swap WBTC for USDT to repay directly
+        // Calculate how much USDT we need to repay (amount borrowed + 0.3% fee)
+        uint256 repayAmount = amount1 * 1000 / 997 + 1; // Adding 1 to handle rounding
+        
+        // Get the WBTC balance we received from liquidation
+        uint256 wbtcBalance = IERC20(WBTC).balanceOf(address(this));
+        
+        // Get reserves to calculate how much WBTC to swap for USDT
+        (uint112 reserve0, uint112 reserve1, ) = IUniswapV2Pair(WBTC_USDT_PAIR).getReserves();
+        
+        // Calculate how much WBTC we need to swap to get enough USDT
+        uint256 wbtcToSwap;
+        if (TOKEN0 == WBTC) {
+            wbtcToSwap = getAmountIn(repayAmount, reserve0, reserve1);
+        } else {
+            wbtcToSwap = getAmountIn(repayAmount, reserve1, reserve0);
+        }
+        
+        // Ensure we have enough WBTC to repay
+        require(wbtcBalance >= wbtcToSwap, "Not enough collateral received");
+        
+        // Approve WBTC transfer to the pair
+        IERC20(WBTC).approve(WBTC_USDT_PAIR, wbtcToSwap);
+        
         // 2.3 repay
-        //    *** Your code here ***
+        // Transfer USDT back to the pair
+        IERC20(USDT).transfer(WBTC_USDT_PAIR, repayAmount);
         
         // END TODO
     }
