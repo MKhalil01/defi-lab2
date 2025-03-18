@@ -137,12 +137,25 @@ contract LiquidationOperator is IUniswapV2Callee {
 
     // Constants defined
     address public owner;
-    address public constant AAVE_LENDING_POOL = 0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9;
-    address public constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
-    address public constant WBTC = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
-    address public constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
-    address public constant UNISWAP_V2_ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
-    address public constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    
+
+    ILendingPool AAVE_LENDING_POOL = ILendingPool(0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9);
+    IUniswapV2Factory UNISWAP_V2_FACTORY = IUniswapV2Factory(0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f);
+
+    //Tokens
+    IWETH constant WETH = IWETH(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+    IERC20 constant WBTC = IERC20(0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599);
+    IERC20 constant USDT = IERC20(0xdAC17F958D2ee523a2206206994597C13D831ec7);
+    
+    //uni pools
+    IUniswapV2Pair WETH_USDT_UNI = IUniswapV2Pair(0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852);
+    IUniswapV2Pair WBTC_WETH_UNI = IUniswapV2Pair(0xBb2b8038a1640196FbE3e38816F3e67Cba72D940);
+    IUniswapV2Pair WBTC_USDT_UNI = IUniswapV2Pair(0x0DE0Fa91b6DbaB8c8503aAA2D1DFa91a192cB149);
+    
+    // USDT Owed
+    uint256 USDT_OWED = 5000 * 1e6;
+    // uint256 USDT_OWED = 2916358033172;
+
     address public constant TARGET_USER = 0x59CE4a2AC5bC3f5F225439B2993b86B42f6d3e9F;
 
 
@@ -200,13 +213,29 @@ constructor() {
         // 0. security checks and initializing variables
         require(msg.sender == owner, "Only the owner can call this function"); // self explanatory
 
-        // Get the uniswap pair for USDT/WBTC
-        address pairAddress = IUniswapV2Factory(UNISWAP_V2_FACTORY).getPair(USDT, WBTC);
-        require(pairAddress != address(0), "Pair doesn't exist");
-        IUniswapV2Pair pair = IUniswapV2Pair(pairAddress);
-
+        // Check all Uni pairs exist
+        require(address(WETH_USDT_UNI) != address(0), "WETH-USDT pair doesn't exist");
+        require(address(WBTC_WETH_UNI) != address(0), "WBTC-WETH pair doesn't exist");
+        require(address(WBTC_USDT_UNI) != address(0), "WBTC-USDT pair doesn't exist");
+        
         // Get lending pool interface
         ILendingPool lendingPool = ILendingPool(AAVE_LENDING_POOL);
+
+        // Check the actual reserves in all pools
+        // WETH-USDT pool
+        (uint112 wethUsdtReserve0, uint112 wethUsdtReserve1, ) = WETH_USDT_UNI.getReserves();
+        console.log("WETH-USDT pool - WETH reserve: %s", wethUsdtReserve0);
+        console.log("WETH-USDT pool - USDT reserve: %s", wethUsdtReserve1);
+        
+        // WBTC-WETH pool
+        (uint112 wbtcWethReserve0, uint112 wbtcWethReserve1, ) = WBTC_WETH_UNI.getReserves();
+        console.log("WBTC-WETH pool - WBTC reserve: %s", wbtcWethReserve0);
+        console.log("WBTC-WETH pool - WETH reserve: %s", wbtcWethReserve1);
+        
+        // WBTC-USDT pool
+        (uint112 wbtcUsdtReserve0, uint112 wbtcUsdtReserve1, ) = WBTC_USDT_UNI.getReserves();
+        console.log("WBTC-USDT pool - WBTC reserve: %s", wbtcUsdtReserve0);
+        console.log("WBTC-USDT pool - USDT reserve: %s", wbtcUsdtReserve1);
 
         // 1. get the target user account data & make sure it is liquidatable
         (
@@ -219,7 +248,7 @@ constructor() {
         ) = lendingPool.getUserAccountData(TARGET_USER);
         
         // Health factor is scaled by 1e18, so 1e18 = 1.0
-        require(healthFactor < 1e18, "User is not liquidatable");
+        require(healthFactor < 10**health_factor_decimals, "User is not liquidatable");
         
         console.log("Health Factor: %s", healthFactor);
         console.log("Total Collateral (ETH): %s", totalCollateralETH);
@@ -230,58 +259,83 @@ constructor() {
         // we know that the target user borrowed USDT with WBTC as collateral
         // we should borrow USDT, liquidate the target user and get the WBTC, then swap WBTC to repay uniswap
         // (please feel free to develop other workflows as long as they liquidate the target user successfully)
-        uint256 usdtToBorrow = 2_500_000 * 1e6;
 
-        // First, check the actual reserves in the pool
-        (uint112 reserve0, uint112 reserve1, ) = pair.getReserves();
-        console.log("WBTC reserve (token0): %s", reserve0);
-        console.log("USDT reserve (token1): %s", reserve1);
-        // For WBTC/USDT pair (can hardcode):
-        // WBTC (0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599) is token0
-        // USDT (0xdAC17F958D2ee523a2206206994597C13D831ec7) is token1
+
+        WBTC_USDT_UNI.swap(0, USDT_OWED, address(this), "$");
         
-        // Determine which token is token0 and token1 in the pair
-        (address token0, ) = USDT < WBTC ? (USDT, WBTC) : (WBTC, USDT);
-        
-        // Set up the amounts to borrow based on token order
-        uint256 amount0Out = token0 == USDT ? usdtToBorrow : 0;
-        uint256 amount1Out = token0 == USDT ? 0 : usdtToBorrow;
-        console.log("amount0Out: %s", amount0Out);
-        console.log("amount1Out %s", amount1Out);        
-        // Encode data for the callback - we don't need to pass any specific data
-        bytes memory data = abi.encode(usdtToBorrow);
-        
-        // Execute the flash swap
-        // This will call our uniswapV2Call function with the borrowed USDT
-        pair.swap(amount0Out, amount1Out, address(this), data);
         
         // 3. Convert the profit into ETH and send back to sender
-        //    *** Your code here ***
 
-        // END TODO
+        uint256 wethbalance = WETH.balanceOf(address(this));
+        WETH.withdraw(wethbalance);
+        payable(msg.sender).transfer(address(this).balance);
+
     }
 
     // required by the swap
     function uniswapV2Call(
-        address,
-        uint256,
+        address sender,
+        uint256 amount0,
         uint256 amount1,
         bytes calldata
     ) external override {
         // TODO: implement your liquidation logic
 
         // 2.0. security checks and initializing variables
-        //    *** Your code here ***
+        require(msg.sender == address(WBTC_USDT_UNI), "Unauthorized callback");
+        require(sender == address(this), "Unauthorized sender");
+
+        // The amount of USDT borrowed from Uniswap
+        uint256 usdtBorrowed = amount1;
+        console.log("USDT borrowed from Uniswap: %s", usdtBorrowed);
 
         // 2.1 liquidate the target user
-        //    *** Your code here ***
+        console.log("Liquidating");
+        // Approve AAVE to use our USDT for liquidation
+        USDT.approve(address(AAVE_LENDING_POOL), usdtBorrowed);
+
+         // Liquidate the target user - we're repaying their USDT debt and receiving WBTC collateral
+        AAVE_LENDING_POOL.liquidationCall(
+            address(WBTC),    // collateral asset (WBTC)
+            address(USDT),    // debt asset (USDT)
+            TARGET_USER,      // user being liquidated
+            usdtBorrowed,     // amount of debt to cover
+            false             // receive the underlying collateral, not aTokens
+        );
+
+        // Get the amount of WBTC we received from liquidation
+        uint256 wbtcReceived = WBTC.balanceOf(address(this));
+        console.log("WBTC received from liquidation: %s", wbtcReceived);
 
         // 2.2 swap WBTC for other things or repay directly
-        //    *** Your code here ***
-
-        // 2.3 repay
-        //    *** Your code here ***
+        // Get the reserves for WBTC-USDT pool
+        (uint112 wbtcUsdtReserve0, uint112 wbtcUsdtReserve1, ) = WBTC_USDT_UNI.getReserves();
         
-        // END TODO
+        // Calculate how much WBTC we need to repay the flash loan
+        uint256 wbtcToRepay = getAmountIn(usdtBorrowed, wbtcUsdtReserve0, wbtcUsdtReserve1);
+        console.log("WBTC to repay: %s", wbtcToRepay);
+
+        // Transfer WBTC directly to the pair to repay
+        WBTC.transfer(address(WBTC_USDT_UNI), wbtcToRepay);
+
+        // Check remaining WBTC balance
+        uint256 remainingWBTC = WBTC.balanceOf(address(this));
+        console.log("WBTC remaining: %s", remainingWBTC);
+
+        if (remainingWBTC > 0) {
+            // Transfer WBTC to the WBTC-WETH pair
+            WBTC.transfer(address(WBTC_WETH_UNI), remainingWBTC);
+            
+            // Get the reserves for WBTC-WETH pool
+            (uint112 wbtcWethReserve0, uint112 wbtcWethReserve1, ) = WBTC_WETH_UNI.getReserves();
+            
+            // Calculate how much WETH we'll get
+            uint256 wethToReceive = getAmountOut(remainingWBTC, wbtcWethReserve0, wbtcWethReserve1);
+            
+            // Swap WBTC for WETH
+            WBTC_WETH_UNI.swap(0, wethToReceive, address(this), "");
+            console.log("WETH received: %s", WETH.balanceOf(address(this)));
+        
+        }
     }
 }
