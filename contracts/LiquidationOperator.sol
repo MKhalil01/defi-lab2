@@ -153,8 +153,8 @@ contract LiquidationOperator is IUniswapV2Callee {
     IUniswapV2Pair WBTC_USDT_UNI = IUniswapV2Pair(0x0DE0Fa91b6DbaB8c8503aAA2D1DFa91a192cB149);
     
     // USDT Owed
-    uint256 USDT_OWED = 5000 * 1e6;
-    // uint256 USDT_OWED = 2916358033172;
+    // uint256 USDT_OWED = 5000 * 1e6;
+    uint256 USDT_OWED = 2916358033172;
 
     address public constant TARGET_USER = 0x59CE4a2AC5bC3f5F225439B2993b86B42f6d3e9F;
 
@@ -255,17 +255,25 @@ constructor() {
         console.log("Total Debt (ETH): %s", totalDebtETH);
 
         // 2. call flash swap to liquidate the target user
-        // based on https://etherscan.io/tx/0xac7df37a43fab1b130318bbb761861b8357650db2e2c6493b73d6da3d9581077
-        // we know that the target user borrowed USDT with WBTC as collateral
-        // we should borrow USDT, liquidate the target user and get the WBTC, then swap WBTC to repay uniswap
-        // (please feel free to develop other workflows as long as they liquidate the target user successfully)
+        // For liquidity and to avoid reentrancy issues we have adopted the following flow:
+        // 1 Borrow WETH from WBTC WETH pair
+        // 2 Swap WETH for USDT using WETH USDT pair
+        // 3 Perform the liquidation to get back WBTC
+        // 4 Swap WBTC for WETH to repay flashloan
+        // 5 Swap remaining WBTC to WETH (or whatever currency) as profits $$$$
 
 
-        WBTC_USDT_UNI.swap(0, USDT_OWED, address(this), "$");
+        // We need to borrow enough WETH to swap for USDT_OWED
+        uint256 wethNeeded = getAmountIn(USDT_OWED, wethUsdtReserve0, wethUsdtReserve1);
+        console.log("WETH needed to get USDT: %s", wethNeeded);
         
+        // Add some buffer to ensure we have enough
+        wethNeeded = wethNeeded * 101 / 100;
+        
+        // Initiate flash swap to borrow WETH
+        WBTC_WETH_UNI.swap(0, wethNeeded, address(this), "$");
         
         // 3. Convert the profit into ETH and send back to sender
-
         uint256 wethbalance = WETH.balanceOf(address(this));
         WETH.withdraw(wethbalance);
         payable(msg.sender).transfer(address(this).balance);
@@ -275,31 +283,47 @@ constructor() {
     // required by the swap
     function uniswapV2Call(
         address sender,
-        uint256 amount0,
+        uint256 ,
         uint256 amount1,
         bytes calldata
     ) external override {
-        // TODO: implement your liquidation logic
 
         // 2.0. security checks and initializing variables
-        require(msg.sender == address(WBTC_USDT_UNI), "Unauthorized callback");
+        require(msg.sender == address(WBTC_WETH_UNI)|| msg.sender == address(WETH_USDT_UNI), "Unauthorized callback");
         require(sender == address(this), "Unauthorized sender");
 
-        // The amount of USDT borrowed from Uniswap
-        uint256 usdtBorrowed = amount1;
-        console.log("USDT borrowed from Uniswap: %s", usdtBorrowed);
+        if (msg.sender == address(WBTC_WETH_UNI)) {
+        // This is the WETH flash loan callback
+        uint256 wethBorrowed = amount1;
+        console.log("WETH borrowed from Uniswap: %s", wethBorrowed);
+        // Get reserves again to ensure we have the latest values
+        // WETH-USDT pool
+        (uint112 wethUsdtReserve0, uint112 wethUsdtReserve1, ) = WETH_USDT_UNI.getReserves();
+        // 1. Swap some WETH for USDT
+        // Approve WETH-USDT pair to use our WETH
+        WETH.approve(address(WETH_USDT_UNI), wethBorrowed);
+        
+        // Calculate how much WETH we need to swap to get USDT_OWED
+        uint256 wethToSwap = getAmountIn(USDT_OWED, wethUsdtReserve0, wethUsdtReserve1);
+        console.log("WETH to swap for USDT: %s", wethToSwap);
+
+        // Transfer WETH to the WETH-USDT pair
+        WETH.transfer(address(WETH_USDT_UNI), wethToSwap);
+
+        // Swap WETH for USDT
+        WETH_USDT_UNI.swap(0, USDT_OWED, address(this), "");
 
         // 2.1 liquidate the target user
         console.log("Liquidating");
         // Approve AAVE to use our USDT for liquidation
-        USDT.approve(address(AAVE_LENDING_POOL), usdtBorrowed);
+        USDT.approve(address(AAVE_LENDING_POOL), USDT_OWED);
 
          // Liquidate the target user - we're repaying their USDT debt and receiving WBTC collateral
         AAVE_LENDING_POOL.liquidationCall(
             address(WBTC),    // collateral asset (WBTC)
             address(USDT),    // debt asset (USDT)
             TARGET_USER,      // user being liquidated
-            usdtBorrowed,     // amount of debt to cover
+            USDT_OWED,     // amount of debt to cover
             false             // receive the underlying collateral, not aTokens
         );
 
@@ -307,35 +331,60 @@ constructor() {
         uint256 wbtcReceived = WBTC.balanceOf(address(this));
         console.log("WBTC received from liquidation: %s", wbtcReceived);
 
-        // 2.2 swap WBTC for other things or repay directly
-        // Get the reserves for WBTC-USDT pool
-        (uint112 wbtcUsdtReserve0, uint112 wbtcUsdtReserve1, ) = WBTC_USDT_UNI.getReserves();
-        
-        // Calculate how much WBTC we need to repay the flash loan
-        uint256 wbtcToRepay = getAmountIn(usdtBorrowed, wbtcUsdtReserve0, wbtcUsdtReserve1);
-        console.log("WBTC to repay: %s", wbtcToRepay);
 
-        // Transfer WBTC directly to the pair to repay
-        WBTC.transfer(address(WBTC_USDT_UNI), wbtcToRepay);
+        //liquidation is working
+
+
+        // WBTC-WETH pool
+        (uint112 wbtcWethReserve0, uint112 wbtcWethReserve1, ) = WBTC_WETH_UNI.getReserves();
+        
+        // Calculate repayment amount (WETH borrowed + 0.3% fee)
+        uint256 wethToRepay = wethBorrowed * 1000 / 997 + 1;
+
+        // Calculate how much WBTC we need to swap to get enough WETH
+        uint256 wbtcToSwap = getAmountIn(wethToRepay, wbtcWethReserve0, wbtcWethReserve1);
+        console.log("WBTC needed to repay flash loan: %s", wbtcToSwap);
+
+        // Make sure we have enough WBTC
+        require(wbtcReceived >= wbtcToSwap, "Not enough WBTC to repay");
+
+        // Approve and transfer WBTC to the WBTC-WETH pair
+        WBTC.approve(address(WBTC_WETH_UNI), wbtcToSwap);
+        WBTC.transfer(address(WBTC_WETH_UNI), wbtcToSwap);
+
+        // Swap WBTC for WETH
+        WBTC_WETH_UNI.swap(0, wethToRepay, address(this), "");
+
+        // Transfer WETH back to the pair to repay the flash loan
+        WETH.transfer(address(WBTC_WETH_UNI), wethToRepay);
 
         // Check remaining WBTC balance
         uint256 remainingWBTC = WBTC.balanceOf(address(this));
         console.log("WBTC remaining: %s", remainingWBTC);
 
+        // Convert any remaining WBTC to WETH for profit
         if (remainingWBTC > 0) {
-            // Transfer WBTC to the WBTC-WETH pair
+            console.log("Remaining WBTC for profit: %s", remainingWBTC);
+
+            // Get latest reserves
+            (uint112 wbtcWethReserve0Latest, uint112 wbtcWethReserve1Latest, ) = WBTC_WETH_UNI.getReserves();
+            
+            // Calculate how much WETH we'll get for remaining WBTC
+            uint256 wethToReceive = getAmountOut(remainingWBTC, wbtcWethReserve0Latest, wbtcWethReserve1Latest);
+            
+            // Transfer WBTC to the pair
             WBTC.transfer(address(WBTC_WETH_UNI), remainingWBTC);
             
-            // Get the reserves for WBTC-WETH pool
-            (uint112 wbtcWethReserve0, uint112 wbtcWethReserve1, ) = WBTC_WETH_UNI.getReserves();
-            
-            // Calculate how much WETH we'll get
-            uint256 wethToReceive = getAmountOut(remainingWBTC, wbtcWethReserve0, wbtcWethReserve1);
-            
-            // Swap WBTC for WETH
+            // Swap for WETH
             WBTC_WETH_UNI.swap(0, wethToReceive, address(this), "");
-            console.log("WETH received: %s", WETH.balanceOf(address(this)));
-        
+            console.log("Additional WETH received: %s", wethToReceive);
         }
+    } 
+
+    else if (msg.sender == address(WETH_USDT_UNI)) {
+        // This is the WETH-USDT swap callback
+        // No need to do anything here as we're not using a flash swap for this pair
     }
+        }
+        
 }
